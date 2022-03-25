@@ -7,7 +7,7 @@ A command line tool for converting eve online gr2 files to json.
 # .compile
 tba
 
-# todo
+# .todo
 - Morph Targets (Probably not required anyway)
 - Mesh min and max bounds
 - Convert all animation data into a single normalized format
