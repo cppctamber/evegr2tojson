@@ -11,6 +11,9 @@ tba
 - Morph Targets (Probably not required anyway)
 - Mesh min and max bounds
 - Convert all animation data into a single normalized format
+- Generate normals when missing
+- Generate bitangents when missing
+- Generate tangents when missing
 
 # .disclaimer
 USE THIS AT YOUR OWN RISK. IF YOU USE THIS, YOU
