@@ -2,7 +2,7 @@
 A command line tool for converting eve online gr2 files to json.
 
 # .usage (windows)
-`evegr2toobj.exe <src> <dest>`
+`evegr2tojson.exe <src> <dest>`
 
 # .compile
 tba
