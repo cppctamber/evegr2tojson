@@ -1,6 +1,6 @@
 # .about
 - `evegr2tojson.exe` - A command line tool for converting eve online gr2 files to json.
-- `blender_gr2_loader.py` - A blender 5.0 plugin for loading `.gr2` and `.gr2_json` file. (Animations are loaded as actions, and very janky atm)
+- `blender_gr2_loader.py` - A blender 5.0 plugin for loading `.gr2` and `.gr2_json` file.
 
 # .usage (windows)
 `evegr2tojson.exe <src> <dest>`
