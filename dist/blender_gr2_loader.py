@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GR2 Importer (via EXE + JSON)",
     "author": "CPPC T'amber",
-    "version": (0, 0, 5),
+    "version": (0, 0, 7),
     "blender": (5, 0, 0),
     "location": "File > Import",
     "description": "Imports GR2 and GR2.JSON files using an external exe",
@@ -45,7 +45,7 @@ class GR2ImporterPreferences(AddonPreferences):
 
     show_console_windows: BoolProperty(
         name="Show console window (Windows)",
-        description="If disabled on Windows, tries to hide the EXE console window when running the dumper.",
+        description="If disabled on Windows, tries to hide the EXE console window when running the evegr2tojson.",
         default=False,
     )
 
@@ -65,6 +65,28 @@ class GR2ImporterPreferences(AddonPreferences):
         soft_max=360.0,
     )
 
+    # UVs
+    flip_uv_v_default: BoolProperty(
+        name="Flip UV V (Y) (default)",
+        description="Flips V (Y) coordinate for UV layers on import.",
+        default=True,
+    )
+
+    # Smoothing groups (Auto Smooth-style)
+    use_smoothing_groups_default: BoolProperty(
+        name="Use smoothing groups (default)",
+        description="Applies Smooth shading + Auto Smooth (angle) to imported meshes.",
+        default=True,
+    )
+
+    smoothing_angle_default: FloatProperty(
+        name="Smoothing angle (degrees)",
+        description="Angle threshold for Auto Smooth (0–180). Higher = smoother.",
+        default=180.0,
+        min=0.0,
+        max=180.0,
+    )
+
     apply_skinning_default: BoolProperty(
         name="Apply Skinning (default)",
         description="Default for Apply Skinning on import operators.",
@@ -80,7 +102,7 @@ class GR2ImporterPreferences(AddonPreferences):
     resample_anims: BoolProperty(
         name="Resample animations (recommended)",
         description="Samples curves at fixed dt (timeStep/oversampling) and keys every sample to avoid quaternion component interpolation artifacts.",
-        default=True,
+        default=False,
     )
 
     max_keys_per_bone: IntProperty(
@@ -135,6 +157,10 @@ class GR2ImporterPreferences(AddonPreferences):
         col.label(text="Defaults:")
         col.prop(self, "import_scale")
         col.prop(self, "import_rot_x_deg")
+        col.prop(self, "flip_uv_v_default")
+        col.separator()
+        col.prop(self, "use_smoothing_groups_default")
+        col.prop(self, "smoothing_angle_default")
         col.separator()
         col.prop(self, "apply_skinning_default")
         col.prop(self, "import_anims_default")
@@ -234,25 +260,125 @@ def _safe_f(v: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+def _apply_smoothing_groups(obj: bpy.types.Object, enable: bool, angle_deg: float) -> None:
+    """
+    Blender 5: Auto Smooth is applied via object operators (not mesh.use_auto_smooth).
+    Best-effort only; does not touch armature/bones.
+    """
+    if not enable:
+        return
+    if obj is None or obj.type != "MESH":
+        return
+
+    angle_rad = math.radians(float(angle_deg))
+
+    # Prefer temp_override so we don't disturb selection/active object
+    try:
+        if hasattr(bpy.context, "temp_override"):
+            with bpy.context.temp_override(
+                active_object=obj,
+                object=obj,
+                selected_objects=[obj],
+                selected_editable_objects=[obj],
+            ):
+                bpy.ops.object.shade_smooth()
+                if hasattr(bpy.ops.object, "shade_auto_smooth"):
+                    bpy.ops.object.shade_auto_smooth(angle=float(angle_rad))
+            return
+    except Exception:
+        pass
+
+    # Fallback: minimally swap selection/active and restore
+    try:
+        vl = bpy.context.view_layer
+        prev_active = vl.objects.active
+        prev_sel = [o for o in vl.objects if o.select_get()]
+
+        for o in prev_sel:
+            o.select_set(False)
+        obj.select_set(True)
+        vl.objects.active = obj
+
+        bpy.ops.object.shade_smooth()
+        if hasattr(bpy.ops.object, "shade_auto_smooth"):
+            bpy.ops.object.shade_auto_smooth(angle=float(angle_rad))
+
+        obj.select_set(False)
+        for o in prev_sel:
+            o.select_set(True)
+        vl.objects.active = prev_active
+    except Exception:
+        pass
+
+def _pick_first_str(d: Dict[str, Any], keys: List[str]) -> Optional[str]:
+    for k in keys:
+        v = d.get(k, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def _get_material_name_from_index(idx_entry: Dict[str, Any], mesh_name: str, i: int) -> str:
+    """
+    Best-effort: infer a stable material/area name from whatever the evegr2tojson provided.
+    Falls back to <mesh>_area_XX.
+    """
+    if not isinstance(idx_entry, dict):
+        return _sanitize_name(f"{mesh_name}_area_{i:02d}")
+
+    # Common candidates across evegr2tojsons/exports
+    n = _pick_first_str(idx_entry, [
+        "materialName",
+        "material",
+        "material_name",
+        "shader",
+        "shaderName",
+        "effect",
+        "areaName",
+        "area",
+        "name",
+        "meshArea",
+        "primitiveGroup",
+        "group",
+    ])
+    if n:
+        return _sanitize_name(n)
+
+    # Sometimes material is nested
+    mat = idx_entry.get("material", None)
+    if isinstance(mat, dict):
+        n2 = _pick_first_str(mat, ["name", "materialName", "shader", "shaderName"])
+        if n2:
+            return _sanitize_name(n2)
+
+    return _sanitize_name(f"{mesh_name}_area_{i:02d}")
+
+def _ensure_material(me: bpy.types.Mesh, mat_name: str) -> int:
+    """
+    Ensures a material datablock exists and is assigned to the mesh's material slots.
+    Returns slot index.
+    """
+    mat_name = _sanitize_name(mat_name) or "Material"
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(name=mat_name)
+
+    # Ensure in mesh slots
+    for si, existing in enumerate(me.materials):
+        if existing == mat:
+            return si
+        if existing and existing.name == mat.name:
+            me.materials[si] = mat
+            return si
+
+    me.materials.append(mat)
+    return len(me.materials) - 1
+
 
 # =============================================================================
 # Mesh import
 # =============================================================================
 
-def _collect_faces(mesh_entry: Dict[str, Any]) -> List[int]:
-    out: List[int] = []
-    indices_list = mesh_entry.get("indices", [])
-    if not isinstance(indices_list, list):
-        return out
-    for idx in indices_list:
-        if not isinstance(idx, dict):
-            continue
-        faces = idx.get("faces", None)
-        if isinstance(faces, list):
-            out.extend(int(x) for x in faces)
-    return out
-
-def _make_uv_layer(mesh: bpy.types.Mesh, uv_name: str, uv_flat: List[float]) -> None:
+def _make_uv_layer(mesh: bpy.types.Mesh, uv_name: str, uv_flat: List[float], flip_v: bool) -> None:
     if not uv_flat or len(uv_flat) < 2 or (len(uv_flat) % 2) != 0:
         return
     vert_uv_count = len(uv_flat) // 2
@@ -267,14 +393,56 @@ def _make_uv_layer(mesh: bpy.types.Mesh, uv_name: str, uv_flat: List[float]) -> 
         if 0 <= vi < vert_uv_count:
             u = float(uv_flat[2 * vi + 0])
             v = float(uv_flat[2 * vi + 1])
+            if flip_v:
+                v = 1.0 - v
             data[li].uv = (u, v)
+
+def _build_faces_and_material_map(mesh_entry: Dict[str, Any], mesh_name: str) -> Tuple[List[Tuple[int, int, int]], List[int], List[str]]:
+    """
+    Builds:
+      faces: list of triangle tuples
+      face_group_ids: per-face group index (0..g-1) matching areas/submeshes
+      group_names: group index -> inferred name
+    """
+    faces: List[Tuple[int, int, int]] = []
+    face_group_ids: List[int] = []
+    group_names: List[str] = []
+
+    indices_list = mesh_entry.get("indices", [])
+    if not isinstance(indices_list, list) or not indices_list:
+        # fallback: no groups
+        return faces, face_group_ids, group_names
+
+    for gi, idx in enumerate(indices_list):
+        if not isinstance(idx, dict):
+            continue
+        flat = idx.get("faces", None)
+        if not isinstance(flat, list) or not flat:
+            continue
+        if (len(flat) % 3) != 0:
+            continue
+
+        group_names.append(_get_material_name_from_index(idx, mesh_name=mesh_name, i=gi))
+
+        tri_count = len(flat) // 3
+        for t in range(tri_count):
+            a = int(flat[t * 3 + 0])
+            b = int(flat[t * 3 + 1])
+            c = int(flat[t * 3 + 2])
+            faces.append((a, b, c))
+            face_group_ids.append(gi)
+
+    return faces, face_group_ids, group_names
 
 def import_meshes(
     gr2: Dict[str, Any],
     collection: bpy.types.Collection,
     instance_name: str,
     scale: float,
-    rot_x_deg: float
+    rot_x_deg: float,
+    use_smoothing_groups: bool,
+    smoothing_angle_deg: float,
+    flip_uv_v: bool,
 ) -> List[Tuple[bpy.types.Object, Dict[str, Any]]]:
     created: List[Tuple[bpy.types.Object, Dict[str, Any]]] = []
 
@@ -301,27 +469,60 @@ def import_meshes(
         vert_count = len(pos) // 3
         verts = [(float(pos[i*3+0]), float(pos[i*3+1]), float(pos[i*3+2])) for i in range(vert_count)]
 
-        faces_flat = _collect_faces(m)
-        if not faces_flat or (len(faces_flat) % 3) != 0:
-            continue
+        faces, face_group_ids, group_names = _build_faces_and_material_map(m, mesh_name=mesh_name)
 
-        faces = [(int(faces_flat[i*3+0]), int(faces_flat[i*3+1]), int(faces_flat[i*3+2]))
-                 for i in range(len(faces_flat)//3)]
+        # Fallback if no grouped faces came through
+        if not faces:
+            # try legacy path if exporter uses a single combined list (rare, but keep compatible)
+            indices_list = m.get("indices", [])
+            faces_flat: List[int] = []
+            if isinstance(indices_list, list):
+                for idx in indices_list:
+                    if not isinstance(idx, dict):
+                        continue
+                    ff = idx.get("faces", None)
+                    if isinstance(ff, list):
+                        faces_flat.extend(int(x) for x in ff)
+            if not faces_flat or (len(faces_flat) % 3) != 0:
+                continue
+            faces = [(int(faces_flat[i*3+0]), int(faces_flat[i*3+1]), int(faces_flat[i*3+2]))
+                     for i in range(len(faces_flat)//3)]
+            face_group_ids = [0] * len(faces)
+            group_names = [_sanitize_name(f"{mesh_name}_area_00")]
 
         me = bpy.data.meshes.new(name=obj_name)
         me.from_pydata(verts, [], faces)
         me.update(calc_edges=True)
 
+        # UVs
         uv0 = v.get("texcoord0", None)
         if isinstance(uv0, list):
-            _make_uv_layer(me, "UV0", uv0)
+            _make_uv_layer(me, "UV0", uv0, flip_v=flip_uv_v)
         uv1 = v.get("texcoord1", None)
         if isinstance(uv1, list):
-            _make_uv_layer(me, "UV1", uv1)
+            _make_uv_layer(me, "UV1", uv1, flip_v=flip_uv_v)
+
+        # Materials / mesh areas: create slots and assign polygon.material_index
+        # Ensure we have a stable slot per group index.
+        group_to_slot: Dict[int, int] = {}
+        for gi, gname in enumerate(group_names):
+            # If name is empty for some reason, still stable per group index
+            if not gname:
+                gname = _sanitize_name(f"{mesh_name}_area_{gi:02d}")
+            slot = _ensure_material(me, gname)
+            group_to_slot[gi] = slot
+
+        # Assign per polygon in creation order (matches faces list order)
+        if face_group_ids and len(me.polygons) == len(face_group_ids):
+            for pi, p in enumerate(me.polygons):
+                gi = int(face_group_ids[pi])
+                p.material_index = int(group_to_slot.get(gi, 0))
 
         obj = bpy.data.objects.new(name=obj_name, object_data=me)
         _link_object(obj, collection)
         _apply_import_transform(obj, scale=scale, rot_x_deg=rot_x_deg)
+
+        _apply_smoothing_groups(obj, enable=use_smoothing_groups, angle_deg=smoothing_angle_deg)
 
         created.append((obj, m))
 
@@ -1164,6 +1365,9 @@ def import_gr2_json(
     import_anims_flag: bool,
     scale: float,
     rot_x_deg: float,
+    flip_uv_v: bool,
+    use_smoothing_groups: bool,
+    smoothing_angle_deg: float,
     resample_anims: bool,
     max_keys_per_bone: int,
     action_length_mode: str,
@@ -1174,7 +1378,15 @@ def import_gr2_json(
     instance_name = _make_unique_instance_name(base_name)
     col = _ensure_collection(f"GR2_{instance_name}")
 
-    mesh_pairs = import_meshes(gr2, col, instance_name=instance_name, scale=scale, rot_x_deg=rot_x_deg)
+    mesh_pairs = import_meshes(
+        gr2, col,
+        instance_name=instance_name,
+        scale=scale,
+        rot_x_deg=rot_x_deg,
+        use_smoothing_groups=use_smoothing_groups,
+        smoothing_angle_deg=smoothing_angle_deg,
+        flip_uv_v=flip_uv_v,
+    )
     arm_obj, arm_info = import_armature(
         gr2, col, instance_name=instance_name, scale=scale, rot_x_deg=rot_x_deg, bone_tail_mode=bone_tail_mode
     )
@@ -1230,10 +1442,33 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
         default=True,
     )
 
+    flip_uv_v: BoolProperty(
+        name="Flip UV V (Y)",
+        description="Flips V (Y) coordinate for UV layers on import.",
+        default=True,
+    )
+
+    use_smoothing_groups: BoolProperty(
+        name="Smoothing groups",
+        description="Applies Smooth shading + Auto Smooth (angle) to imported meshes.",
+        default=True,
+    )
+
+    smoothing_angle: FloatProperty(
+        name="Smoothing angle (degrees)",
+        description="Angle threshold for Auto Smooth (0–180). Higher = smoother.",
+        default=180.0,
+        min=0.0,
+        max=180.0,
+    )
+
     def invoke(self, context, event):
         prefs = _prefs(context)
         self.apply_skinning = bool(prefs.apply_skinning_default)
         self.import_animations = bool(prefs.import_anims_default)
+        self.flip_uv_v = bool(prefs.flip_uv_v_default)
+        self.use_smoothing_groups = bool(prefs.use_smoothing_groups_default)
+        self.smoothing_angle = float(prefs.smoothing_angle_default)
         return super().invoke(context, event)
 
     def execute(self, context):
@@ -1257,10 +1492,10 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
         try:
             subprocess.run([exe, gr2_path], check=True, creationflags=creationflags)
         except subprocess.CalledProcessError as e:
-            self.report({"ERROR"}, f"Dumper EXE failed: {e}")
+            self.report({"ERROR"}, f"evegr2tojson EXE failed: {e}")
             return {"CANCELLED"}
         except Exception as e:
-            self.report({"ERROR"}, f"Failed to run dumper EXE: {e}")
+            self.report({"ERROR"}, f"Failed to run evegr2tojson EXE: {e}")
             return {"CANCELLED"}
 
         if not os.path.isfile(out_json):
@@ -1281,6 +1516,9 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
             import_anims_flag=bool(self.import_animations),
             scale=float(prefs.import_scale),
             rot_x_deg=float(prefs.import_rot_x_deg),
+            flip_uv_v=bool(self.flip_uv_v),
+            use_smoothing_groups=bool(self.use_smoothing_groups),
+            smoothing_angle_deg=float(self.smoothing_angle),
             resample_anims=bool(prefs.resample_anims),
             max_keys_per_bone=int(prefs.max_keys_per_bone),
             action_length_mode=str(prefs.action_length_mode),
@@ -1312,10 +1550,33 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
         default=True,
     )
 
+    flip_uv_v: BoolProperty(
+        name="Flip UV V (Y)",
+        description="Flips V (Y) coordinate for UV layers on import.",
+        default=True,
+    )
+
+    use_smoothing_groups: BoolProperty(
+        name="Smoothing groups",
+        description="Applies Smooth shading + Auto Smooth (angle) to imported meshes.",
+        default=True,
+    )
+
+    smoothing_angle: FloatProperty(
+        name="Smoothing angle (degrees)",
+        description="Angle threshold for Auto Smooth (0–180). Higher = smoother.",
+        default=180.0,
+        min=0.0,
+        max=180.0,
+    )
+
     def invoke(self, context, event):
         prefs = _prefs(context)
         self.apply_skinning = bool(prefs.apply_skinning_default)
         self.import_animations = bool(prefs.import_anims_default)
+        self.flip_uv_v = bool(prefs.flip_uv_v_default)
+        self.use_smoothing_groups = bool(prefs.use_smoothing_groups_default)
+        self.smoothing_angle = float(prefs.smoothing_angle_default)
         return super().invoke(context, event)
 
     def execute(self, context):
@@ -1339,6 +1600,9 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
             import_anims_flag=bool(self.import_animations),
             scale=float(prefs.import_scale),
             rot_x_deg=float(prefs.import_rot_x_deg),
+            flip_uv_v=bool(self.flip_uv_v),
+            use_smoothing_groups=bool(self.use_smoothing_groups),
+            smoothing_angle_deg=float(self.smoothing_angle),
             resample_anims=bool(prefs.resample_anims),
             max_keys_per_bone=int(prefs.max_keys_per_bone),
             action_length_mode=str(prefs.action_length_mode),
