@@ -1,10 +1,10 @@
 bl_info = {
     "name": "GR2 Importer (via EXE + JSON)",
-    "author": "Paul Oosterman",
-    "version": (1, 4, 1),
+    "author": "CPPC T'amber",
+    "version": (0, 0, 5),
     "blender": (5, 0, 0),
     "location": "File > Import",
-    "description": "Imports GR2 JSON emitted by an external dumper (meshes + skeleton + animations as Actions). Optional skinning.",
+    "description": "Imports GR2 and GR2.JSON files using an external exe",
     "category": "Import-Export",
 }
 
@@ -18,7 +18,13 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 import bpy
 from bpy.types import Operator, AddonPreferences
-from bpy.props import StringProperty, BoolProperty, FloatProperty
+from bpy.props import (
+    StringProperty,
+    BoolProperty,
+    FloatProperty,
+    IntProperty,
+    EnumProperty,
+)
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Vector, Quaternion
 
@@ -31,7 +37,7 @@ class GR2ImporterPreferences(AddonPreferences):
     bl_idname = __name__
 
     exe_path: StringProperty(
-        name="evegr2tojson EXE path",
+        name="evegr2tojson file path",
         description="Path to your evegr2tojson EXE. Must output <input_without_ext>.gr2_json next to the input.",
         subtype="FILE_PATH",
         default="",
@@ -39,7 +45,7 @@ class GR2ImporterPreferences(AddonPreferences):
 
     show_console_windows: BoolProperty(
         name="Show console window (Windows)",
-        description="If disabled on Windows, tries to hide the EXE console window when running the converter.",
+        description="If disabled on Windows, tries to hide the EXE console window when running the dumper.",
         default=False,
     )
 
@@ -72,8 +78,36 @@ class GR2ImporterPreferences(AddonPreferences):
     )
 
     resample_anims: BoolProperty(
-        name="Resample animations (recommended)",
+        name="Resample animations",
         description="Samples curves at fixed dt (timeStep/oversampling) and keys every sample to avoid quaternion component interpolation artifacts.",
+        default=False,
+    )
+
+    max_keys_per_bone: IntProperty(
+        name="Max keys per bone (safety)",
+        description="Limits the number of keyed samples per bone per action. 0 = unlimited. Helps prevent Blender freezing/crashing on huge rigs.",
+        default=0,
+        min=0,
+        soft_max=20000,
+    )
+
+    action_length_mode: EnumProperty(
+        name="Action length mode",
+        description="How to set action.frame_end (fixes animations stopping too soon or being too long).",
+        items=[
+            ("DURATION", "Use animation.duration", "Use duration from JSON only."),
+            ("MAX_KEYS", "Use last keyed time", "Use the last time that received keys."),
+            ("MIN_OF_BOTH", "Min(duration, last keyed)", "Use whichever ends sooner."),
+            ("MAX_OF_BOTH", "Max(duration, last keyed)", "Use whichever ends later."),
+        ],
+        default="DURATION",
+    )
+
+    # NEW: some JSONs (e.g. deade1_t1) have skeleton bones with no rest transforms.
+    # We can synthesize rest pose from animation t=0 if needed.
+    synthesize_rest_from_anim: BoolProperty(
+        name="Synthesize rest pose from animations (if missing)",
+        description="If skeleton bones lack position/orientation/scaleShear, build rest pose from the animation track values at t=0 (chooses animation with most tracks).",
         default=True,
     )
 
@@ -90,6 +124,10 @@ class GR2ImporterPreferences(AddonPreferences):
         col.prop(self, "import_anims_default")
         col.separator()
         col.prop(self, "resample_anims")
+        col.prop(self, "max_keys_per_bone")
+        col.prop(self, "action_length_mode")
+        col.separator()
+        col.prop(self, "synthesize_rest_from_anim")
 
 
 def _prefs(context) -> GR2ImporterPreferences:
@@ -128,7 +166,6 @@ def _make_unique_instance_name(base: str) -> str:
     i = 1
     while True:
         candidate = f"{base}_{i:03d}"
-        # we use collection name "GR2_<candidate>" but also candidate itself for objects/actions
         if candidate not in used and f"GR2_{candidate}" not in used:
             return candidate
         i += 1
@@ -322,205 +359,7 @@ def _compute_rest_matrices(bones: List[Dict[str, Any]]) -> Tuple[List[Matrix], L
 
 
 # =============================================================================
-# Armature import
-# =============================================================================
-
-def import_armature(
-    gr2: Dict[str, Any],
-    collection: bpy.types.Collection,
-    instance_name: str,
-    scale: float,
-    rot_x_deg: float
-) -> Tuple[Optional[bpy.types.Object], Dict[str, Any]]:
-    models = gr2.get("models", [])
-    if not isinstance(models, list) or not models:
-        return None, {}
-
-    skel = models[0].get("skeleton", None)
-    if not isinstance(skel, dict):
-        return None, {}
-
-    bones = skel.get("bones", [])
-    if not isinstance(bones, list) or not bones:
-        return None, {}
-
-    arm_name = f"{instance_name}_Armature"
-    arm_data = bpy.data.armatures.new(arm_name)
-    arm_obj = bpy.data.objects.new(arm_name, arm_data)
-    _link_object(arm_obj, collection)
-
-    _apply_import_transform(arm_obj, scale=scale, rot_x_deg=rot_x_deg)
-
-    rest_local, rest_world = _compute_rest_matrices(bones)
-
-    name_to_index: Dict[str, int] = {}
-    for i, b in enumerate(bones):
-        bn = (b.get("name") or f"Bone_{i}")
-        if isinstance(bn, str):
-            name_to_index[bn] = i
-
-    bpy.context.view_layer.objects.active = arm_obj
-    arm_obj.select_set(True)
-    bpy.ops.object.mode_set(mode="EDIT")
-
-    edit_bones: List[bpy.types.EditBone] = []
-    for i, b in enumerate(bones):
-        bn = (b.get("name") or f"Bone_{i}")
-        eb = arm_data.edit_bones.new(bn)
-        edit_bones.append(eb)
-
-    for i, b in enumerate(bones):
-        parent = int(b.get("parentIndex", -1))
-        if 0 <= parent < len(edit_bones):
-            edit_bones[i].parent = edit_bones[parent]
-
-    children: List[List[int]] = [[] for _ in range(len(bones))]
-    for i, b in enumerate(bones):
-        p = int(b.get("parentIndex", -1))
-        if 0 <= p < len(bones):
-            children[p].append(i)
-
-    for i, eb in enumerate(edit_bones):
-        M = rest_world[i].copy()
-        eb.matrix = M
-
-        head = Vector(eb.head)
-        if children[i]:
-            avg = Vector((0.0, 0.0, 0.0))
-            for ci in children[i]:
-                avg += Vector(rest_world[ci].to_translation())
-            avg /= max(1, len(children[i]))
-            direction = (avg - head)
-            if direction.length < 1e-6:
-                direction = (M.to_3x3() @ Vector((0.0, 0.1, 0.0)))
-            eb.tail = head + direction.normalized() * max(direction.length, 0.05)
-        else:
-            y_axis = (M.to_3x3() @ Vector((0.0, 1.0, 0.0)))
-            if y_axis.length < 1e-6:
-                y_axis = Vector((0.0, 0.1, 0.0))
-            eb.tail = head + y_axis.normalized() * 0.05
-
-    bpy.ops.object.mode_set(mode="OBJECT")
-    arm_obj.select_set(False)
-
-    return arm_obj, {
-        "bones_json": bones,
-        "name_to_index": name_to_index,
-        "rest_local": rest_local,
-        "rest_world": rest_world,
-    }
-
-
-# =============================================================================
-# Skinning
-# =============================================================================
-
-def _ensure_armature_modifier(mesh_obj: bpy.types.Object, arm_obj: bpy.types.Object) -> None:
-    for mod in mesh_obj.modifiers:
-        if mod.type == "ARMATURE" and mod.object == arm_obj:
-            return
-    mod = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
-    mod.object = arm_obj
-
-def _get_binding_bone_name(mesh_entry: Dict[str, Any], binding_index: int) -> Optional[str]:
-    binds = mesh_entry.get("boneBindings", [])
-    if not isinstance(binds, list):
-        return None
-    if 0 <= binding_index < len(binds):
-        b = binds[binding_index]
-        if isinstance(b, dict):
-            n = b.get("name", None)
-            return n if isinstance(n, str) and n else None
-    return None
-
-def _as_int_index(v) -> int:
-    try:
-        return int(v)
-    except Exception:
-        try:
-            return int(float(v))
-        except Exception:
-            return 0
-
-def _parse_weights4(raw4: List[Any]) -> List[float]:
-    w = [float(x) for x in raw4]
-    maxw = max(w) if w else 0.0
-    if maxw > 1.0001:
-        scale = 255.0 if maxw <= 255.0 else 65535.0
-        w = [wi / scale for wi in w]
-    w = [0.0 if wi < 0.0 else (1.0 if wi > 1.0 else wi) for wi in w]
-    s = w[0] + w[1] + w[2] + w[3]
-    if s > 0.0:
-        w = [wi / s for wi in w]
-    else:
-        w = [1.0, 0.0, 0.0, 0.0]
-    return w
-
-def apply_skinning(mesh_obj: bpy.types.Object, mesh_entry: Dict[str, Any], arm_obj: bpy.types.Object) -> None:
-    if mesh_obj.type != "MESH" or arm_obj is None or arm_obj.type != "ARMATURE":
-        return
-
-    v = mesh_entry.get("vertex", {})
-    if not isinstance(v, dict):
-        return
-
-    pos = v.get("position", [])
-    if not isinstance(pos, list) or (len(pos) % 3) != 0:
-        return
-    vert_count = len(pos) // 3
-    if vert_count <= 0:
-        return
-
-    blend_i = v.get("blendIndice", [])
-    blend_w = v.get("blendWeight", [])
-    if not isinstance(blend_i, list) or len(blend_i) < vert_count * 4:
-        return
-
-    has_weights = isinstance(blend_w, list) and len(blend_w) >= vert_count * 4
-    if has_weights:
-        sample = blend_w[:min(len(blend_w), 4096)]
-        try:
-            if all(float(x) == 0.0 for x in sample):
-                has_weights = False
-        except Exception:
-            pass
-
-    _ensure_armature_modifier(mesh_obj, arm_obj)
-
-    vgroups: Dict[str, bpy.types.VertexGroup] = {}
-    def get_vg(name: str) -> bpy.types.VertexGroup:
-        vg = vgroups.get(name)
-        if vg is None:
-            vg = mesh_obj.vertex_groups.get(name)
-            if vg is None:
-                vg = mesh_obj.vertex_groups.new(name=name)
-            vgroups[name] = vg
-        return vg
-
-    arm_bones = arm_obj.data.bones
-
-    for vi in range(vert_count):
-        idx_base = vi * 4
-        weights = _parse_weights4(blend_w[idx_base:idx_base+4]) if has_weights else [1.0, 0.0, 0.0, 0.0]
-
-        for j in range(4):
-            w = float(weights[j])
-            if w <= 0.0:
-                continue
-
-            binding_index = _as_int_index(blend_i[idx_base + j])
-            bone_name = _get_binding_bone_name(mesh_entry, binding_index)
-            if not bone_name:
-                continue
-            if bone_name not in arm_bones:
-                continue
-
-            vg = get_vg(bone_name)
-            vg.add([vi], w, "REPLACE")
-
-
-# =============================================================================
-# Curve decoding
+# Curve decoding (used by animation import AND rest synthesis)
 # =============================================================================
 
 def _u32_to_f32_bits(u: int) -> float:
@@ -763,6 +602,365 @@ def decode_curve(curve: Dict[str, Any], expected_dim: int, time_step: float) -> 
 
 
 # =============================================================================
+# Rest pose synthesis (for files where skeleton bones lack transforms)
+# =============================================================================
+
+def _skeleton_has_rest_transforms(bones: List[Dict[str, Any]]) -> bool:
+    # If *any* bone has explicit position/orientation/scaleShear, treat as present.
+    for b in bones:
+        if not isinstance(b, dict):
+            continue
+        if ("position" in b) or ("orientation" in b) or ("scaleShear" in b):
+            return True
+    return False
+
+def _pick_best_animation_for_rest(gr2: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    anims = gr2.get("animations", [])
+    if not isinstance(anims, list) or not anims:
+        return None
+
+    best = None
+    best_tracks = -1
+    for anim in anims:
+        if not isinstance(anim, dict):
+            continue
+        tg = anim.get("trackGroups", [])
+        if not isinstance(tg, list) or not tg:
+            continue
+        # count total transformTracks across all groups
+        total = 0
+        for g in tg:
+            if not isinstance(g, dict):
+                continue
+            tracks = g.get("transformTracks", [])
+            if isinstance(tracks, list):
+                total += len(tracks)
+        if total > best_tracks:
+            best_tracks = total
+            best = anim
+    return best
+
+def _build_track_map(anim: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    bone_tracks: Dict[str, Dict[str, Any]] = {}
+    track_groups = anim.get("trackGroups", [])
+    if not isinstance(track_groups, list):
+        return bone_tracks
+    for tg in track_groups:
+        if not isinstance(tg, dict):
+            continue
+        tracks = tg.get("transformTracks", [])
+        if not isinstance(tracks, list):
+            continue
+        for tr in tracks:
+            if not isinstance(tr, dict):
+                continue
+            bn = tr.get("name", None)
+            if isinstance(bn, str) and bn:
+                bone_tracks[bn] = tr
+    return bone_tracks
+
+def _first_value_or_default(times: List[float], vals: List[List[float]], default: List[float]) -> List[float]:
+    if not times or not vals:
+        return default
+    # Use the first decoded value (t=0 or earliest)
+    v = vals[0]
+    n = min(len(v), len(default))
+    out = [float(default[i]) for i in range(len(default))]
+    for i in range(n):
+        out[i] = float(v[i])
+    return out
+
+def _ensure_rest_transforms_from_anim_if_missing(
+    gr2: Dict[str, Any],
+    bones: List[Dict[str, Any]],
+    synthesize: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Returns a new bones list (dict copies) guaranteed to have:
+      position[3], orientation[4] (xyzw), scaleShear[9]
+    If skeleton already has them, returns copies unchanged.
+    If missing and synthesize=True, uses animation t=0 as bind/rest pose.
+    """
+    out: List[Dict[str, Any]] = [dict(b) if isinstance(b, dict) else {} for b in bones]
+
+    if _skeleton_has_rest_transforms(bones):
+        # Ensure required keys exist per bone (fill defaults where missing).
+        for b in out:
+            if "position" not in b:
+                b["position"] = [0.0, 0.0, 0.0]
+            if "orientation" not in b:
+                b["orientation"] = [0.0, 0.0, 0.0, 1.0]
+            if "scaleShear" not in b:
+                b["scaleShear"] = [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]
+        return out
+
+    # Skeleton has *no* rest transforms at all.
+    # If synthesize is off, just fill defaults (this will collapse bones at origin).
+    if not synthesize:
+        for b in out:
+            b["position"] = [0.0, 0.0, 0.0]
+            b["orientation"] = [0.0, 0.0, 0.0, 1.0]
+            b["scaleShear"] = [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]
+        return out
+
+    anim = _pick_best_animation_for_rest(gr2)
+    if anim is None:
+        for b in out:
+            b["position"] = [0.0, 0.0, 0.0]
+            b["orientation"] = [0.0, 0.0, 0.0, 1.0]
+            b["scaleShear"] = [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]
+        return out
+
+    time_step = float(anim.get("timeStep", 1.0/30.0) or (1.0/30.0))
+    track_map = _build_track_map(anim)
+
+    for i, b in enumerate(out):
+        name = b.get("name", None)
+        tr = track_map.get(name, None) if isinstance(name, str) else None
+
+        def_pos3 = [0.0, 0.0, 0.0]
+        def_rot4 = [0.0, 0.0, 0.0, 1.0]  # xyzw
+        def_ss9  = [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]
+
+        pos3 = def_pos3
+        rot4 = def_rot4
+        ss9  = def_ss9
+
+        if isinstance(tr, dict):
+            pc = tr.get("position", {})
+            oc = tr.get("orientation", {})
+            sc = tr.get("scaleShear", {})
+
+            if isinstance(pc, dict):
+                t, v = decode_curve(pc, expected_dim=3, time_step=time_step)
+                pos3 = _first_value_or_default(t, v, def_pos3)
+            if isinstance(oc, dict):
+                t, v = decode_curve(oc, expected_dim=4, time_step=time_step)
+                rot4 = _first_value_or_default(t, v, def_rot4)
+                # Normalize quat
+                q = _quat_xyzw_to_mathutils(rot4).normalized()
+                rot4 = [q.x, q.y, q.z, q.w]
+            if isinstance(sc, dict):
+                t, v = decode_curve(sc, expected_dim=9, time_step=time_step)
+                ss9 = _first_value_or_default(t, v, def_ss9)
+
+        b["position"] = [float(pos3[0]), float(pos3[1]), float(pos3[2])]
+        b["orientation"] = [float(rot4[0]), float(rot4[1]), float(rot4[2]), float(rot4[3])]
+        b["scaleShear"] = [float(x) for x in ss9[:9]] if isinstance(ss9, list) else def_ss9[:]
+
+    return out
+
+
+# =============================================================================
+# Armature import
+# =============================================================================
+
+def import_armature(
+    gr2: Dict[str, Any],
+    collection: bpy.types.Collection,
+    instance_name: str,
+    scale: float,
+    rot_x_deg: float,
+    synthesize_rest_from_anim: bool,
+) -> Tuple[Optional[bpy.types.Object], Dict[str, Any]]:
+    models = gr2.get("models", [])
+    if not isinstance(models, list) or not models:
+        return None, {}
+
+    skel = models[0].get("skeleton", None)
+    if not isinstance(skel, dict):
+        return None, {}
+
+    bones_raw = skel.get("bones", [])
+    if not isinstance(bones_raw, list) or not bones_raw:
+        return None, {}
+
+    # Ensure bones have rest transforms (either from skeleton or synthesized from anim)
+    bones = _ensure_rest_transforms_from_anim_if_missing(gr2, bones_raw, synthesize=synthesize_rest_from_anim)
+
+    arm_name = f"{instance_name}_Armature"
+    arm_data = bpy.data.armatures.new(arm_name)
+    arm_obj = bpy.data.objects.new(arm_name, arm_data)
+    _link_object(arm_obj, collection)
+
+    _apply_import_transform(arm_obj, scale=scale, rot_x_deg=rot_x_deg)
+
+    rest_local, rest_world = _compute_rest_matrices(bones)
+
+    name_to_index: Dict[str, int] = {}
+    for i, b in enumerate(bones):
+        bn = (b.get("name") or f"Bone_{i}")
+        if isinstance(bn, str):
+            name_to_index[bn] = i
+
+    bpy.context.view_layer.objects.active = arm_obj
+    arm_obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+
+    edit_bones: List[bpy.types.EditBone] = []
+    for i, b in enumerate(bones):
+        bn = (b.get("name") or f"Bone_{i}")
+        eb = arm_data.edit_bones.new(bn)
+        edit_bones.append(eb)
+
+    for i, b in enumerate(bones):
+        parent = int(b.get("parentIndex", -1))
+        if 0 <= parent < len(edit_bones):
+            edit_bones[i].parent = edit_bones[parent]
+
+    children: List[List[int]] = [[] for _ in range(len(bones))]
+    for i, b in enumerate(bones):
+        p = int(b.get("parentIndex", -1))
+        if 0 <= p < len(bones):
+            children[p].append(i)
+
+    for i, eb in enumerate(edit_bones):
+        M = rest_world[i].copy()
+        eb.matrix = M
+
+        head = Vector(eb.head)
+
+        # Use children only to estimate a nice display length
+        if children[i]:
+            avg = Vector((0.0, 0.0, 0.0))
+            for ci in children[i]:
+                avg += Vector(rest_world[ci].to_translation())
+            avg /= max(1, len(children[i]))
+            length = (avg - head).length
+        else:
+            length = 0.05
+
+        if length < 1e-4:
+            length = 0.05
+
+        # IMPORTANT: preserve Granny bone basis.
+        # Tail goes along Granny local +Y axis (in armature space).
+        y_axis = (M.to_3x3() @ Vector((0.0, 1.0, 0.0)))
+        if y_axis.length < 1e-6:
+            y_axis = Vector((0.0, 1.0, 0.0))
+
+        eb.tail = head + y_axis.normalized() * length
+
+    bpy.ops.object.mode_set(mode="OBJECT")
+    arm_obj.select_set(False)
+
+    return arm_obj, {
+        "bones_json": bones,
+        "name_to_index": name_to_index,
+        "rest_local": rest_local,
+        "rest_world": rest_world,
+    }
+
+
+# =============================================================================
+# Skinning
+# =============================================================================
+
+def _ensure_armature_modifier(mesh_obj: bpy.types.Object, arm_obj: bpy.types.Object) -> None:
+    for mod in mesh_obj.modifiers:
+        if mod.type == "ARMATURE" and mod.object == arm_obj:
+            return
+    mod = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+    mod.object = arm_obj
+
+def _get_binding_bone_name(mesh_entry: Dict[str, Any], binding_index: int) -> Optional[str]:
+    binds = mesh_entry.get("boneBindings", [])
+    if not isinstance(binds, list):
+        return None
+    if 0 <= binding_index < len(binds):
+        b = binds[binding_index]
+        if isinstance(b, dict):
+            n = b.get("name", None)
+            return n if isinstance(n, str) and n else None
+    return None
+
+def _as_int_index(v) -> int:
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return 0
+
+def _parse_weights4(raw4: List[Any]) -> List[float]:
+    w = [float(x) for x in raw4]
+    maxw = max(w) if w else 0.0
+    if maxw > 1.0001:
+        scale = 255.0 if maxw <= 255.0 else 65535.0
+        w = [wi / scale for wi in w]
+    w = [0.0 if wi < 0.0 else (1.0 if wi > 1.0 else wi) for wi in w]
+    s = w[0] + w[1] + w[2] + w[3]
+    if s > 0.0:
+        w = [wi / s for wi in w]
+    else:
+        w = [1.0, 0.0, 0.0, 0.0]
+    return w
+
+def apply_skinning(mesh_obj: bpy.types.Object, mesh_entry: Dict[str, Any], arm_obj: bpy.types.Object) -> None:
+    if mesh_obj.type != "MESH" or arm_obj is None or arm_obj.type != "ARMATURE":
+        return
+
+    v = mesh_entry.get("vertex", {})
+    if not isinstance(v, dict):
+        return
+
+    pos = v.get("position", [])
+    if not isinstance(pos, list) or (len(pos) % 3) != 0:
+        return
+    vert_count = len(pos) // 3
+    if vert_count <= 0:
+        return
+
+    blend_i = v.get("blendIndice", [])
+    blend_w = v.get("blendWeight", [])
+    if not isinstance(blend_i, list) or len(blend_i) < vert_count * 4:
+        return
+
+    has_weights = isinstance(blend_w, list) and len(blend_w) >= vert_count * 4
+    if has_weights:
+        sample = blend_w[:min(len(blend_w), 4096)]
+        try:
+            if all(float(x) == 0.0 for x in sample):
+                has_weights = False
+        except Exception:
+            pass
+
+    _ensure_armature_modifier(mesh_obj, arm_obj)
+
+    vgroups: Dict[str, bpy.types.VertexGroup] = {}
+    def get_vg(name: str) -> bpy.types.VertexGroup:
+        vg = vgroups.get(name)
+        if vg is None:
+            vg = mesh_obj.vertex_groups.get(name)
+            if vg is None:
+                vg = mesh_obj.vertex_groups.new(name=name)
+            vgroups[name] = vg
+        return vg
+
+    arm_bones = arm_obj.data.bones
+
+    for vi in range(vert_count):
+        idx_base = vi * 4
+        weights = _parse_weights4(blend_w[idx_base:idx_base+4]) if has_weights else [1.0, 0.0, 0.0, 0.0]
+
+        for j in range(4):
+            w = float(weights[j])
+            if w <= 0.0:
+                continue
+
+            binding_index = _as_int_index(blend_i[idx_base + j])
+            bone_name = _get_binding_bone_name(mesh_entry, binding_index)
+            if not bone_name:
+                continue
+            if bone_name not in arm_bones:
+                continue
+
+            vg = get_vg(bone_name)
+            vg.add([vi], w, "REPLACE")
+
+
+# =============================================================================
 # Animation import (resample + slerp)
 # =============================================================================
 
@@ -829,6 +1027,7 @@ def _find_segment(times: List[float], t: float) -> Tuple[int, float]:
     if t >= times[last]:
         return (last, 0.0)
 
+    # Linear scan is fine here; times lists are typically small compared to bone count.
     for i in range(last):
         t0 = times[i]
         t1 = times[i + 1]
@@ -875,12 +1074,29 @@ def _eval_quat_curve_xyzw(times: List[float], vals_xyzw: List[List[float]], t: f
     q = qa.slerp(qb, f).normalized()
     return [q.x, q.y, q.z, q.w]
 
+def _choose_action_end_frame(length_mode: str, dur_end: float, key_end: float) -> float:
+    # Both inputs are frames (not seconds)
+    dur_end = float(dur_end) if dur_end else 0.0
+    key_end = float(key_end) if key_end else 0.0
+
+    if length_mode == "DURATION":
+        return dur_end
+    if length_mode == "MAX_KEYS":
+        return key_end
+    if length_mode == "MIN_OF_BOTH":
+        candidates = [x for x in (dur_end, key_end) if x > 0.0]
+        return min(candidates) if candidates else 0.0
+    # MAX_OF_BOTH
+    return max(dur_end, key_end)
+
 def import_animations(
     gr2: Dict[str, Any],
     arm_obj: bpy.types.Object,
     arm_info: Dict[str, Any],
     instance_name: str,
-    resample: bool
+    resample: bool,
+    max_keys_per_bone: int,
+    action_length_mode: str,
 ) -> List[bpy.types.Action]:
     actions: List[bpy.types.Action] = []
     anims = gr2.get("animations", [])
@@ -919,7 +1135,7 @@ def import_animations(
         actions.append(action)
         arm_obj.animation_data.action = action
 
-        max_frame = 0.0
+        max_frame_keys = 0.0
 
         bone_tracks: Dict[str, Dict[str, Any]] = {}
         track_groups = anim.get("trackGroups", [])
@@ -981,13 +1197,13 @@ def import_animations(
                 dt = float(time_step) / float(oversampling)
                 dt = max(1e-6, dt)
 
-                if duration <= 0.0:
-                    duration = _get_max_time_from_tracks(pos_times, rot_times, ss_times)
+                # If duration is missing, infer from available curves for this bone.
+                local_duration = duration if duration > 0.0 else _get_max_time_from_tracks(pos_times, rot_times, ss_times)
 
-                steps = int(math.floor((duration / dt) + 0.5)) if duration > 0.0 else 0
+                steps = int(math.floor((local_duration / dt) + 0.5)) if local_duration > 0.0 else 0
                 sample_times = [i * dt for i in range(max(1, steps + 1))]
-                if duration > 0.0 and (not sample_times or abs(sample_times[-1] - duration) > 1e-6):
-                    sample_times.append(duration)
+                if local_duration > 0.0 and (not sample_times or abs(sample_times[-1] - local_duration) > 1e-6):
+                    sample_times.append(local_duration)
             else:
                 s: Set[float] = set()
                 for t in pos_times:
@@ -997,6 +1213,10 @@ def import_animations(
                 for t in ss_times:
                     s.add(float(t))
                 sample_times = sorted(s) if s else [0.0]
+
+            # Safety: limit number of keyed samples per bone.
+            if max_keys_per_bone and max_keys_per_bone > 0 and len(sample_times) > max_keys_per_bone:
+                sample_times = sample_times[:max_keys_per_bone]
 
             pb.rotation_mode = "QUATERNION"
 
@@ -1013,8 +1233,8 @@ def import_animations(
                 scl = delta.to_scale()
 
                 frame = _time_to_frame(t, fps)
-                if frame > max_frame:
-                    max_frame = frame
+                if frame > max_frame_keys:
+                    max_frame_keys = frame
 
                 pb.location = loc
                 pb.rotation_quaternion = rot
@@ -1024,8 +1244,12 @@ def import_animations(
                 pb.keyframe_insert(data_path="rotation_quaternion", frame=frame, group=bn)
                 pb.keyframe_insert(data_path="scale", frame=frame, group=bn)
 
+        # Action length selection
+        dur_end = _time_to_frame(duration, fps) if duration > 0.0 else 0.0
+        end = _choose_action_end_frame(action_length_mode, dur_end=dur_end, key_end=max_frame_keys)
+
         action.frame_start = 0.0
-        action.frame_end = max(0.0, max_frame)
+        action.frame_end = max(1.0, float(end)) if end > 0.0 else max(1.0, float(max_frame_keys))
 
         try:
             scene.frame_end = max(scene.frame_end, int(math.ceil(action.frame_end)))
@@ -1048,12 +1272,22 @@ def import_gr2_json(
     scale: float,
     rot_x_deg: float,
     resample_anims: bool,
+    max_keys_per_bone: int,
+    action_length_mode: str,
+    synthesize_rest_from_anim: bool,
 ) -> Dict[str, Any]:
     instance_name = _make_unique_instance_name(base_name)
     col = _ensure_collection(f"GR2_{instance_name}")
 
     mesh_pairs = import_meshes(gr2, col, instance_name=instance_name, scale=scale, rot_x_deg=rot_x_deg)
-    arm_obj, arm_info = import_armature(gr2, col, instance_name=instance_name, scale=scale, rot_x_deg=rot_x_deg)
+    arm_obj, arm_info = import_armature(
+        gr2,
+        col,
+        instance_name=instance_name,
+        scale=scale,
+        rot_x_deg=rot_x_deg,
+        synthesize_rest_from_anim=synthesize_rest_from_anim,
+    )
 
     if apply_skinning_flag and arm_obj is not None:
         for mesh_obj, mesh_entry in mesh_pairs:
@@ -1061,7 +1295,15 @@ def import_gr2_json(
 
     actions: List[bpy.types.Action] = []
     if import_anims_flag and arm_obj is not None:
-        actions = import_animations(gr2, arm_obj, arm_info, instance_name=instance_name, resample=resample_anims)
+        actions = import_animations(
+            gr2,
+            arm_obj,
+            arm_info,
+            instance_name=instance_name,
+            resample=resample_anims,
+            max_keys_per_bone=max_keys_per_bone,
+            action_length_mode=action_length_mode,
+        )
 
     return {
         "instance_name": instance_name,
@@ -1148,6 +1390,9 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
             scale=float(prefs.import_scale),
             rot_x_deg=float(prefs.import_rot_x_deg),
             resample_anims=bool(prefs.resample_anims),
+            max_keys_per_bone=int(prefs.max_keys_per_bone),
+            action_length_mode=str(prefs.action_length_mode),
+            synthesize_rest_from_anim=bool(prefs.synthesize_rest_from_anim),
         )
         self.report({"INFO"}, f"Imported: {result.get('instance_name')}")
         return {"FINISHED"}
@@ -1201,6 +1446,9 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
             scale=float(prefs.import_scale),
             rot_x_deg=float(prefs.import_rot_x_deg),
             resample_anims=bool(prefs.resample_anims),
+            max_keys_per_bone=int(prefs.max_keys_per_bone),
+            action_length_mode=str(prefs.action_length_mode),
+            synthesize_rest_from_anim=bool(prefs.synthesize_rest_from_anim),
         )
         self.report({"INFO"}, f"Imported: {result.get('instance_name')}")
         return {"FINISHED"}
