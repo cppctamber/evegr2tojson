@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GR2 Importer (via EXE + JSON)",
     "author": "CPPC T'amber",
-    "version": (0, 0, 7),
+    "version": (0, 0, 9),
     "blender": (5, 0, 0),
     "location": "File > Import",
     "description": "Imports GR2 and GR2.JSON files using an external exe",
@@ -72,6 +72,13 @@ class GR2ImporterPreferences(AddonPreferences):
         default=True,
     )
 
+    # Packed tangents -> custom normals
+    try_unpack_tangents_default: BoolProperty(
+        name="Try to unpack tangents (default)",
+        description="If normals are missing but packed tangents exist, tries to unpack them and apply custom split normals.",
+        default=True,
+    )
+
     # Smoothing groups (Auto Smooth-style)
     use_smoothing_groups_default: BoolProperty(
         name="Use smoothing groups (default)",
@@ -100,7 +107,7 @@ class GR2ImporterPreferences(AddonPreferences):
     )
 
     resample_anims: BoolProperty(
-        name="Resample animations (recommended)",
+        name="Resample animations",
         description="Samples curves at fixed dt (timeStep/oversampling) and keys every sample to avoid quaternion component interpolation artifacts.",
         default=False,
     )
@@ -158,6 +165,7 @@ class GR2ImporterPreferences(AddonPreferences):
         col.prop(self, "import_scale")
         col.prop(self, "import_rot_x_deg")
         col.prop(self, "flip_uv_v_default")
+        col.prop(self, "try_unpack_tangents_default")
         col.separator()
         col.prop(self, "use_smoothing_groups_default")
         col.prop(self, "smoothing_angle_default")
@@ -203,6 +211,8 @@ def _make_unique_instance_name(base: str) -> str:
         used.add(o.name)
     for a in bpy.data.actions:
         used.add(a.name)
+    for m in bpy.data.materials:
+        used.add(m.name)
 
     i = 1
     while True:
@@ -310,68 +320,158 @@ def _apply_smoothing_groups(obj: bpy.types.Object, enable: bool, angle_deg: floa
     except Exception:
         pass
 
-def _pick_first_str(d: Dict[str, Any], keys: List[str]) -> Optional[str]:
-    for k in keys:
-        v = d.get(k, None)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
+
+# =============================================================================
+# Materials / Mesh Areas
+# =============================================================================
 
 def _get_material_name_from_index(idx_entry: Dict[str, Any], mesh_name: str, i: int) -> str:
-    """
-    Best-effort: infer a stable material/area name from whatever the evegr2tojson provided.
-    Falls back to <mesh>_area_XX.
-    """
-    if not isinstance(idx_entry, dict):
-        return _sanitize_name(f"{mesh_name}_area_{i:02d}")
+    # Ignore exporter-provided names: always area01/area02...
+    return f"area{i+1:02d}"
 
-    # Common candidates across evegr2tojsons/exports
-    n = _pick_first_str(idx_entry, [
-        "materialName",
-        "material",
-        "material_name",
-        "shader",
-        "shaderName",
-        "effect",
-        "areaName",
-        "area",
-        "name",
-        "meshArea",
-        "primitiveGroup",
-        "group",
-    ])
-    if n:
-        return _sanitize_name(n)
-
-    # Sometimes material is nested
-    mat = idx_entry.get("material", None)
-    if isinstance(mat, dict):
-        n2 = _pick_first_str(mat, ["name", "materialName", "shader", "shaderName"])
-        if n2:
-            return _sanitize_name(n2)
-
-    return _sanitize_name(f"{mesh_name}_area_{i:02d}")
-
-def _ensure_material(me: bpy.types.Mesh, mat_name: str) -> int:
+def _ensure_material(me: bpy.types.Mesh, instance_name: str, mat_name: str) -> int:
     """
     Ensures a material datablock exists and is assigned to the mesh's material slots.
+    Uniqueness is enforced per-import instance:
+      <instance_name>.<mat_name>
     Returns slot index.
     """
-    mat_name = _sanitize_name(mat_name) or "Material"
-    mat = bpy.data.materials.get(mat_name)
-    if mat is None:
-        mat = bpy.data.materials.new(name=mat_name)
+    base = _sanitize_name(mat_name) or "Material"
+    full = _sanitize_name(instance_name) + "." + base
 
-    # Ensure in mesh slots
-    for si, existing in enumerate(me.materials):
-        if existing == mat:
-            return si
-        if existing and existing.name == mat.name:
-            me.materials[si] = mat
-            return si
+    mat = bpy.data.materials.get(full)
+    if mat is None:
+        mat = bpy.data.materials.new(name=full)
 
     me.materials.append(mat)
     return len(me.materials) - 1
+
+
+# =============================================================================
+# Packed tangents -> normals (quadV5_PosTexTanTexL01 decode)
+# =============================================================================
+
+_TAU = 6.28318548
+_PI = 3.14159274
+_INV_TAU = 0.159154937
+_HALF = 0.5
+
+def _fract(x: float) -> float:
+    return x - math.floor(x)
+
+def _decode_packed_tangent_frame_attr2(attr2_xyzw: List[float]) -> Tuple[Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float]]:
+    """
+    Mirrors the vertex shader unpack used in quadV5_PosTexTanTexL01 (attr2 path).
+    Input: 4 floats in [0..1] (typical) from vertex["tangent"] (packed)
+    Output: (N, T, B) in object space:
+      N == r4.xyz (basis "v1" in pixel shader)
+      T == r3.xyz (basis "v2")
+      B == r0.xyz (basis "v3")
+    """
+    if not isinstance(attr2_xyzw, list) or len(attr2_xyzw) < 4:
+        return (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+
+    x = float(attr2_xyzw[0])
+    y = float(attr2_xyzw[1])
+    z = float(attr2_xyzw[2])
+    w = float(attr2_xyzw[3])
+
+    # r0 = v2 * TAU - PI
+    r0x = x * _TAU - _PI
+    r0y = y * _TAU - _PI
+    r0z = z * _TAU - _PI
+    r0w = w * _TAU - _PI
+
+    # sign_select = (0 < r0.y) AND (0 < r0.w)
+    bit_y = 1.0 if (0.0 < r0y) else 0.0
+    bit_w = 1.0 if (0.0 < r0w) else 0.0
+    sign_select = bit_y * bit_w
+
+    # r0 = fract(r0 * INV_TAU + 0.5) * TAU - PI
+    r0x = (_fract(r0x * _INV_TAU + _HALF) * _TAU) - _PI
+    r0y = (_fract(r0y * _INV_TAU + _HALF) * _TAU) - _PI
+    r0z = (_fract(r0z * _INV_TAU + _HALF) * _TAU) - _PI
+    r0w = (_fract(r0w * _INV_TAU + _HALF) * _TAU) - _PI
+
+    # r3.xy = (cos(r0.x), sin(r0.x))
+    r3x = math.cos(r0x)
+    r3y = math.sin(r0x)
+
+    # r4.xy = (cos(r0.y), sin(r0.y))
+    c_y = math.cos(r0y)
+    s_y = math.sin(r0y)
+
+    # r3.xy *= abs(r4.y); r3.z = r4.x
+    ay = abs(s_y)
+    r3x *= ay
+    r3y *= ay
+    r3z = c_y
+
+    # r4.xy = (cos(r0.z), sin(r0.z))
+    c_z = math.cos(r0z)
+    s_z = math.sin(r0z)
+
+    # r5.xy = (cos(r0.w), sin(r0.w))
+    c_w = math.cos(r0w)
+    s_w = math.sin(r0w)
+
+    # r0.xyz (bitangent basis candidate)
+    aw = abs(s_w)
+    b_x = c_z * aw
+    b_y = s_z * aw
+    b_z = c_w
+
+    # cross(T, B)
+    cx = (r3y * b_z) - (r3z * b_y)
+    cy = (r3z * b_x) - (r3x * b_z)
+    cz = (r3x * b_y) - (r3y * b_x)
+
+    # N = mix(-cross, cross, sign_select)
+    if sign_select >= 0.5:
+        nx, ny, nz = cx, cy, cz
+    else:
+        nx, ny, nz = -cx, -cy, -cz
+
+    return (nx, ny, nz), (r3x, r3y, r3z), (b_x, b_y, b_z)
+
+def _apply_custom_normals_from_packed_tangents(me: bpy.types.Mesh, vtx_tangent_flat: List[Any], vert_count: int) -> bool:
+    """
+    Given packed tangents (4 floats per vertex), decode normals and set custom split normals.
+    Returns True if applied.
+    """
+    if not isinstance(vtx_tangent_flat, list) or vert_count <= 0:
+        return False
+    if len(vtx_tangent_flat) < vert_count * 4:
+        return False
+
+    try:
+        me.calc_normals_split()
+
+        loop_normals: List[Tuple[float,float,float]] = []
+        loops = me.loops
+
+        for loop in loops:
+            vi = loop.vertex_index
+            base = vi * 4
+            p4 = vtx_tangent_flat[base:base+4]
+            N, _T, _B = _decode_packed_tangent_frame_attr2(p4)
+
+            l = math.sqrt(N[0]*N[0] + N[1]*N[1] + N[2]*N[2]) or 1.0
+            loop_normals.append((N[0]/l, N[1]/l, N[2]/l))
+
+        if len(loop_normals) != len(loops):
+            me.free_normals_split()
+            return False
+
+        me.normals_split_custom_set(loop_normals)
+        me.free_normals_split()
+        return True
+    except Exception:
+        try:
+            me.free_normals_split()
+        except Exception:
+            pass
+        return False
 
 
 # =============================================================================
@@ -402,7 +502,7 @@ def _build_faces_and_material_map(mesh_entry: Dict[str, Any], mesh_name: str) ->
     Builds:
       faces: list of triangle tuples
       face_group_ids: per-face group index (0..g-1) matching areas/submeshes
-      group_names: group index -> inferred name
+      group_names: group index -> inferred name (area01/area02...)
     """
     faces: List[Tuple[int, int, int]] = []
     face_group_ids: List[int] = []
@@ -443,6 +543,7 @@ def import_meshes(
     use_smoothing_groups: bool,
     smoothing_angle_deg: float,
     flip_uv_v: bool,
+    try_unpack_tangents: bool,
 ) -> List[Tuple[bpy.types.Object, Dict[str, Any]]]:
     created: List[Tuple[bpy.types.Object, Dict[str, Any]]] = []
 
@@ -488,7 +589,7 @@ def import_meshes(
             faces = [(int(faces_flat[i*3+0]), int(faces_flat[i*3+1]), int(faces_flat[i*3+2]))
                      for i in range(len(faces_flat)//3)]
             face_group_ids = [0] * len(faces)
-            group_names = [_sanitize_name(f"{mesh_name}_area_00")]
+            group_names = ["area01"]
 
         me = bpy.data.meshes.new(name=obj_name)
         me.from_pydata(verts, [], faces)
@@ -503,20 +604,27 @@ def import_meshes(
             _make_uv_layer(me, "UV1", uv1, flip_v=flip_uv_v)
 
         # Materials / mesh areas: create slots and assign polygon.material_index
-        # Ensure we have a stable slot per group index.
         group_to_slot: Dict[int, int] = {}
         for gi, gname in enumerate(group_names):
-            # If name is empty for some reason, still stable per group index
             if not gname:
-                gname = _sanitize_name(f"{mesh_name}_area_{gi:02d}")
-            slot = _ensure_material(me, gname)
+                gname = f"area{gi+1:02d}"
+            slot = _ensure_material(me, instance_name, gname)
             group_to_slot[gi] = slot
 
-        # Assign per polygon in creation order (matches faces list order)
         if face_group_ids and len(me.polygons) == len(face_group_ids):
             for pi, p in enumerate(me.polygons):
                 gi = int(face_group_ids[pi])
                 p.material_index = int(group_to_slot.get(gi, 0))
+
+        # If normals are missing, try unpack tangents and apply custom split normals
+        # (Expected packed stream: vertex["tangent"] = 4 floats per vertex)
+        if try_unpack_tangents:
+            nrm = v.get("normal", None)
+            has_normals = isinstance(nrm, list) and (len(nrm) >= vert_count * 3)
+            if not has_normals:
+                tan = v.get("tangent", None)
+                if isinstance(tan, list):
+                    _apply_custom_normals_from_packed_tangents(me, tan, vert_count)
 
         obj = bpy.data.objects.new(name=obj_name, object_data=me)
         _link_object(obj, collection)
@@ -1198,7 +1306,7 @@ def import_animations(
 
         anim_name_raw = anim.get("name", "Action") or "Action"
         anim_name = _sanitize_name(anim_name_raw)
-        full_action_name = _unique_action_name(f"{instance_name}_{anim_name}")
+        full_action_name = _unique_action_name(f"{instance_name}.{anim_name}")
 
         duration = float(anim.get("duration", 0.0) or 0.0)
         time_step = float(anim.get("timeStep", 1.0/30.0) or (1.0/30.0))
@@ -1368,6 +1476,7 @@ def import_gr2_json(
     flip_uv_v: bool,
     use_smoothing_groups: bool,
     smoothing_angle_deg: float,
+    try_unpack_tangents: bool,
     resample_anims: bool,
     max_keys_per_bone: int,
     action_length_mode: str,
@@ -1386,6 +1495,7 @@ def import_gr2_json(
         use_smoothing_groups=use_smoothing_groups,
         smoothing_angle_deg=smoothing_angle_deg,
         flip_uv_v=flip_uv_v,
+        try_unpack_tangents=try_unpack_tangents,
     )
     arm_obj, arm_info = import_armature(
         gr2, col, instance_name=instance_name, scale=scale, rot_x_deg=rot_x_deg, bone_tail_mode=bone_tail_mode
@@ -1448,6 +1558,12 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
         default=True,
     )
 
+    try_unpack_tangents: BoolProperty(
+        name="Try to unpack tangents",
+        description="If normals are missing but packed tangents exist, tries to unpack them and apply custom split normals.",
+        default=True,
+    )
+
     use_smoothing_groups: BoolProperty(
         name="Smoothing groups",
         description="Applies Smooth shading + Auto Smooth (angle) to imported meshes.",
@@ -1467,6 +1583,7 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
         self.apply_skinning = bool(prefs.apply_skinning_default)
         self.import_animations = bool(prefs.import_anims_default)
         self.flip_uv_v = bool(prefs.flip_uv_v_default)
+        self.try_unpack_tangents = bool(prefs.try_unpack_tangents_default)
         self.use_smoothing_groups = bool(prefs.use_smoothing_groups_default)
         self.smoothing_angle = float(prefs.smoothing_angle_default)
         return super().invoke(context, event)
@@ -1519,6 +1636,7 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
             flip_uv_v=bool(self.flip_uv_v),
             use_smoothing_groups=bool(self.use_smoothing_groups),
             smoothing_angle_deg=float(self.smoothing_angle),
+            try_unpack_tangents=bool(self.try_unpack_tangents),
             resample_anims=bool(prefs.resample_anims),
             max_keys_per_bone=int(prefs.max_keys_per_bone),
             action_length_mode=str(prefs.action_length_mode),
@@ -1556,6 +1674,12 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
         default=True,
     )
 
+    try_unpack_tangents: BoolProperty(
+        name="Try to unpack tangents",
+        description="If normals are missing but packed tangents exist, tries to unpack them and apply custom split normals.",
+        default=True,
+    )
+
     use_smoothing_groups: BoolProperty(
         name="Smoothing groups",
         description="Applies Smooth shading + Auto Smooth (angle) to imported meshes.",
@@ -1575,6 +1699,7 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
         self.apply_skinning = bool(prefs.apply_skinning_default)
         self.import_animations = bool(prefs.import_anims_default)
         self.flip_uv_v = bool(prefs.flip_uv_v_default)
+        self.try_unpack_tangents = bool(prefs.try_unpack_tangents_default)
         self.use_smoothing_groups = bool(prefs.use_smoothing_groups_default)
         self.smoothing_angle = float(prefs.smoothing_angle_default)
         return super().invoke(context, event)
@@ -1603,6 +1728,7 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
             flip_uv_v=bool(self.flip_uv_v),
             use_smoothing_groups=bool(self.use_smoothing_groups),
             smoothing_angle_deg=float(self.smoothing_angle),
+            try_unpack_tangents=bool(self.try_unpack_tangents),
             resample_anims=bool(prefs.resample_anims),
             max_keys_per_bone=int(prefs.max_keys_per_bone),
             action_length_mode=str(prefs.action_length_mode),
