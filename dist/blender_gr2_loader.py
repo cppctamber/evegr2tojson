@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GR2 Importer (via EXE + JSON)",
     "author": "CPPC T'amber",
-    "version": (0, 0, 9),
+    "version": (0, 0, 10),
     "blender": (5, 0, 0),
     "location": "File > Import",
     "description": "Imports GR2 and GR2.JSON files using an external exe",
@@ -72,6 +72,13 @@ class GR2ImporterPreferences(AddonPreferences):
         default=True,
     )
 
+    # LODs
+    skip_lods_default: BoolProperty(
+        name="Skip LOD meshes (default)",
+        description="Skips meshes that look like LODs (name contains 'LOD').",
+        default=True,
+    )
+
     # Packed tangents -> custom normals
     try_unpack_tangents_default: BoolProperty(
         name="Try to unpack tangents (default)",
@@ -107,7 +114,7 @@ class GR2ImporterPreferences(AddonPreferences):
     )
 
     resample_anims: BoolProperty(
-        name="Resample animations",
+        name="Resample animations (recommended)",
         description="Samples curves at fixed dt (timeStep/oversampling) and keys every sample to avoid quaternion component interpolation artifacts.",
         default=False,
     )
@@ -165,6 +172,7 @@ class GR2ImporterPreferences(AddonPreferences):
         col.prop(self, "import_scale")
         col.prop(self, "import_rot_x_deg")
         col.prop(self, "flip_uv_v_default")
+        col.prop(self, "skip_lods_default")
         col.prop(self, "try_unpack_tangents_default")
         col.separator()
         col.prop(self, "use_smoothing_groups_default")
@@ -190,7 +198,8 @@ def _prefs(context) -> GR2ImporterPreferences:
 # Naming helpers
 # =============================================================================
 
-_name_sanitize_re = re.compile(r"[^A-Za-z0-9_]+")
+# Allow dots in names so we can produce <instance>.<action> etc (Blender-safe).
+_name_sanitize_re = re.compile(r"[^A-Za-z0-9_.]+")
 
 def _sanitize_name(s: str) -> str:
     s = (s or "").strip()
@@ -202,6 +211,12 @@ def _sanitize_name(s: str) -> str:
     return s or "GR2"
 
 def _make_unique_instance_name(base: str) -> str:
+    """
+    Blender-style instance naming:
+      base
+      base.001
+      base.002
+    """
     base = _sanitize_name(base)
 
     used: Set[str] = set()
@@ -214,9 +229,12 @@ def _make_unique_instance_name(base: str) -> str:
     for m in bpy.data.materials:
         used.add(m.name)
 
+    if base not in used and f"GR2_{base}" not in used:
+        return base
+
     i = 1
     while True:
-        candidate = f"{base}_{i:03d}"
+        candidate = f"{base}.{i:03d}"
         if candidate not in used and f"GR2_{candidate}" not in used:
             return candidate
         i += 1
@@ -227,7 +245,7 @@ def _unique_action_name(name: str) -> str:
         return name
     i = 1
     while True:
-        candidate = f"{name}_{i:03d}"
+        candidate = f"{name}.{i:03d}"
         if bpy.data.actions.get(candidate) is None:
             return candidate
         i += 1
@@ -337,7 +355,7 @@ def _ensure_material(me: bpy.types.Mesh, instance_name: str, mat_name: str) -> i
     Returns slot index.
     """
     base = _sanitize_name(mat_name) or "Material"
-    full = _sanitize_name(instance_name) + "." + base
+    full = f"{_sanitize_name(instance_name)}.{base}"
 
     mat = bpy.data.materials.get(full)
     if mat is None:
@@ -543,6 +561,7 @@ def import_meshes(
     use_smoothing_groups: bool,
     smoothing_angle_deg: float,
     flip_uv_v: bool,
+    skip_lods: bool,
     try_unpack_tangents: bool,
 ) -> List[Tuple[bpy.types.Object, Dict[str, Any]]]:
     created: List[Tuple[bpy.types.Object, Dict[str, Any]]] = []
@@ -555,8 +574,13 @@ def import_meshes(
         if not isinstance(m, dict):
             continue
 
-        raw_mesh_name = m.get("name", "GR2Mesh")
-        mesh_name = _sanitize_name(raw_mesh_name)
+        raw_mesh_name = m.get("name", "GR2Mesh") or "GR2Mesh"
+        raw_mesh_name_str = raw_mesh_name if isinstance(raw_mesh_name, str) else str(raw_mesh_name)
+
+        if skip_lods and ("lod" in raw_mesh_name_str.lower()):
+            continue
+
+        mesh_name = _sanitize_name(raw_mesh_name_str)
         obj_name = f"{instance_name}_{mesh_name}"
 
         v = m.get("vertex", {})
@@ -574,7 +598,6 @@ def import_meshes(
 
         # Fallback if no grouped faces came through
         if not faces:
-            # try legacy path if exporter uses a single combined list (rare, but keep compatible)
             indices_list = m.get("indices", [])
             faces_flat: List[int] = []
             if isinstance(indices_list, list):
@@ -1378,7 +1401,6 @@ def import_animations(
             if rot_times and rot_vals:
                 rot_vals = _ensure_quat_continuity_xyzw(rot_vals)
 
-            # Determine sampling duration
             if duration > 0.0:
                 local_duration = duration
             else:
@@ -1402,7 +1424,6 @@ def import_animations(
                     s.add(float(t))
                 sample_times = sorted(s) if s else [0.0]
 
-            # Clamp to animation.duration if requested and duration is present
             if clamp_keys_to_duration and duration > 0.0:
                 d = float(duration)
                 sample_times = [t for t in sample_times if t <= d + 1e-8]
@@ -1411,7 +1432,6 @@ def import_animations(
                 if abs(sample_times[-1] - d) > 1e-6:
                     sample_times.append(d)
 
-            # Safety: limit number of keyed samples per bone.
             if max_keys_per_bone and max_keys_per_bone > 0 and len(sample_times) > max_keys_per_bone:
                 sample_times = sample_times[:max_keys_per_bone]
 
@@ -1444,7 +1464,6 @@ def import_animations(
         dur_end = _time_to_frame(duration, fps) if duration > 0.0 else 0.0
         end = _choose_action_end_frame(action_length_mode, dur_end=dur_end, key_end=max_frame_keys)
 
-        # If clamping is enabled and duration exists, never let end exceed duration end (+ padding)
         if clamp_keys_to_duration and duration > 0.0:
             end = min(float(end), float(dur_end))
 
@@ -1476,6 +1495,7 @@ def import_gr2_json(
     flip_uv_v: bool,
     use_smoothing_groups: bool,
     smoothing_angle_deg: float,
+    skip_lods: bool,
     try_unpack_tangents: bool,
     resample_anims: bool,
     max_keys_per_bone: int,
@@ -1495,6 +1515,7 @@ def import_gr2_json(
         use_smoothing_groups=use_smoothing_groups,
         smoothing_angle_deg=smoothing_angle_deg,
         flip_uv_v=flip_uv_v,
+        skip_lods=skip_lods,
         try_unpack_tangents=try_unpack_tangents,
     )
     arm_obj, arm_info = import_armature(
@@ -1558,6 +1579,12 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
         default=True,
     )
 
+    skip_lods: BoolProperty(
+        name="Skip LOD meshes",
+        description="Skips meshes that look like LODs (name contains 'LOD').",
+        default=True,
+    )
+
     try_unpack_tangents: BoolProperty(
         name="Try to unpack tangents",
         description="If normals are missing but packed tangents exist, tries to unpack them and apply custom split normals.",
@@ -1583,6 +1610,7 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
         self.apply_skinning = bool(prefs.apply_skinning_default)
         self.import_animations = bool(prefs.import_anims_default)
         self.flip_uv_v = bool(prefs.flip_uv_v_default)
+        self.skip_lods = bool(prefs.skip_lods_default)
         self.try_unpack_tangents = bool(prefs.try_unpack_tangents_default)
         self.use_smoothing_groups = bool(prefs.use_smoothing_groups_default)
         self.smoothing_angle = float(prefs.smoothing_angle_default)
@@ -1636,6 +1664,7 @@ class IMPORT_OT_gr2_via_exe(Operator, ImportHelper):
             flip_uv_v=bool(self.flip_uv_v),
             use_smoothing_groups=bool(self.use_smoothing_groups),
             smoothing_angle_deg=float(self.smoothing_angle),
+            skip_lods=bool(self.skip_lods),
             try_unpack_tangents=bool(self.try_unpack_tangents),
             resample_anims=bool(prefs.resample_anims),
             max_keys_per_bone=int(prefs.max_keys_per_bone),
@@ -1674,6 +1703,12 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
         default=True,
     )
 
+    skip_lods: BoolProperty(
+        name="Skip LOD meshes",
+        description="Skips meshes that look like LODs (name contains 'LOD').",
+        default=True,
+    )
+
     try_unpack_tangents: BoolProperty(
         name="Try to unpack tangents",
         description="If normals are missing but packed tangents exist, tries to unpack them and apply custom split normals.",
@@ -1699,6 +1734,7 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
         self.apply_skinning = bool(prefs.apply_skinning_default)
         self.import_animations = bool(prefs.import_anims_default)
         self.flip_uv_v = bool(prefs.flip_uv_v_default)
+        self.skip_lods = bool(prefs.skip_lods_default)
         self.try_unpack_tangents = bool(prefs.try_unpack_tangents_default)
         self.use_smoothing_groups = bool(prefs.use_smoothing_groups_default)
         self.smoothing_angle = float(prefs.smoothing_angle_default)
@@ -1728,6 +1764,7 @@ class IMPORT_OT_gr2_json(Operator, ImportHelper):
             flip_uv_v=bool(self.flip_uv_v),
             use_smoothing_groups=bool(self.use_smoothing_groups),
             smoothing_angle_deg=float(self.smoothing_angle),
+            skip_lods=bool(self.skip_lods),
             try_unpack_tangents=bool(self.try_unpack_tangents),
             resample_anims=bool(prefs.resample_anims),
             max_keys_per_bone=int(prefs.max_keys_per_bone),
