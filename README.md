@@ -3,7 +3,19 @@
 - `blender_gr2_loader.py` - A blender 5.0 plugin for loading `.gr2` and `.gr2_json` file.
 
 # .usage (windows)
+Command line:
 `evegr2tojson.exe <src> <dest>`
+
+Blender 5.0 plugin:
+1. Download the contents of /dist
+2. Load Blender 5.0
+3. Open Edit > Preferences > Addons
+4. From the top right corner "v" icon, select "Install From Disk..."
+5. Select the "blender_gr2_loader.py" file
+6. Find the installed plugin and set the "evegr2tojson file path" to where "evegr2tojson.exe" is
+7. File > Import > GR2
+
+Animations are loaded as Actions ( Animation > Action Editor ).
 
 # .compile
 tba
