@@ -60,7 +60,7 @@ HELD LIABLE FOR ANY CONSEQUENCES THAT MIGHT OCCUR BECAUSE OF ITS USAGE.
 # Licensing Notes
 
 This project is derived from or related to `Helia01/GrannyMeshDumper`, with
-additional EVE-specific JSON output behavior.
+additional mesh, model, curve, animation, skeleton and JSON output.
 
 The bundled executable is provided as-is for local tooling. Third-party runtime
 dependencies, including Granny DLLs, must be obtained separately by the user and
