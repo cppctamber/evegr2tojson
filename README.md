@@ -1,3 +1,13 @@
+# Deprecated
+
+This repository is no longer maintained. It is kept only as a historical reference for the old EVE GR2 to JSON converter and Blender helper.
+
+Status: deprecated as of July 2026. New issues and pull requests are not expected to be handled here.
+
+Replacement path: CarbonEngineJS `@carbonenginejs/format-gr2`.
+
+---
+
 # .about
 
 - `evegr2tojson.exe` - A command line tool for converting EVE Online `.gr2` files to JSON.
